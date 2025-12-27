@@ -45,13 +45,20 @@ function collectSelectedItems() {
   for (const row of rows) {
     const selected = row.getAttribute('aria-selected') === 'true' || !!row.querySelector('div[role="checkbox"][aria-checked="true"]');
     if (!selected) continue;
-    let messageId = null;
-    const msgSpan = row.querySelector('span[data-legacy-message-id]');
-    if (msgSpan) messageId = msgSpan.getAttribute('data-legacy-message-id');
-    if (!messageId) messageId = row.getAttribute('data-legacy-message-id') || row.getAttribute('data-message-id');
-    if (messageId && !seen.has('m:'+messageId)) {
-      items.push({ kind: 'message', id: messageId });
-      seen.add('m:'+messageId);
+    // Extract both Gmail internal message id (legacy) and header id if available
+    let headerId = row.getAttribute('data-message-id');
+    if (!headerId) {
+      const msgA = row.querySelector('[data-message-id]');
+      if (msgA) headerId = msgA.getAttribute('data-message-id');
+    }
+    let gmailId = row.getAttribute('data-legacy-message-id');
+    if (!gmailId) {
+      const msgSpan = row.querySelector('span[data-legacy-message-id]');
+      if (msgSpan) gmailId = msgSpan.getAttribute('data-legacy-message-id');
+    }
+    if (gmailId && !seen.has('m:'+gmailId)) {
+      items.push({ kind: 'message', id: gmailId });
+      seen.add('m:'+gmailId);
       continue;
     }
     let threadId = row.getAttribute('data-legacy-thread-id') || row.getAttribute('data-thread-id');
@@ -69,14 +76,11 @@ function collectSelectedItems() {
     for (const r of rows2) {
       const selected = !!r.querySelector('div[role="checkbox"][aria-checked="true"]');
       if (!selected) continue;
-      let messageId = r.getAttribute('data-legacy-message-id') || r.getAttribute('data-message-id');
-      if (!messageId) {
-        const msg = r.querySelector('[data-legacy-message-id],[data-message-id]');
-        if (msg) messageId = msg.getAttribute('data-legacy-message-id') || msg.getAttribute('data-message-id');
-      }
-      if (messageId && !seen.has('m:'+messageId)) {
-        items.push({ kind: 'message', id: messageId });
-        seen.add('m:'+messageId);
+      let headerId = r.getAttribute('data-message-id') || (r.querySelector('[data-message-id]') && r.querySelector('[data-message-id]').getAttribute('data-message-id')) || null;
+      let gmailId = r.getAttribute('data-legacy-message-id') || (r.querySelector('[data-legacy-message-id]') && r.querySelector('[data-legacy-message-id]').getAttribute('data-legacy-message-id')) || null;
+      if (gmailId && !seen.has('m:'+gmailId)) {
+        items.push({ kind: 'message', id: gmailId });
+        seen.add('m:'+gmailId);
         continue;
       }
       let threadId = r.getAttribute('data-legacy-thread-id') || r.getAttribute('data-thread-id');
@@ -93,14 +97,40 @@ function collectSelectedItems() {
   return items;
 }
 
-function getOpenEmailText() {
+function getOpenEmailInfo() {
   const bodies = Array.from(document.querySelectorAll('.a3s'));
   const visible = bodies.filter((el) => el.offsetParent !== null);
   const node = visible[visible.length - 1] || bodies[bodies.length - 1];
-  if (!node) return "";
+  if (!node) return { text: "", messageId: null, headerId: null };
   const clone = node.cloneNode(true);
   clone.querySelectorAll('script,style,noscript').forEach((n) => n.remove());
-  return (clone.innerText || "").trim();
+  const text = (clone.innerText || "").trim();
+  // Try to locate the message-id near/around this body node
+  let messageId = null;
+  let headerId = null;
+  let cur = node;
+  for (let i = 0; cur && i < 6; i++) {
+    if (cur.getAttribute) {
+      headerId = headerId || cur.getAttribute('data-message-id');
+      messageId = messageId || cur.getAttribute('data-legacy-message-id');
+      if (messageId) break;
+      const found = cur.querySelector && (cur.querySelector('[data-message-id]') || cur.querySelector('[data-legacy-message-id]'));
+      if (found) {
+        headerId = headerId || found.getAttribute('data-message-id');
+        messageId = messageId || found.getAttribute('data-legacy-message-id');
+        if (messageId) break;
+      }
+    }
+    cur = cur.parentElement;
+  }
+  if (!messageId) {
+    const any = document.querySelector('[data-message-id],[data-legacy-message-id]');
+    if (any) {
+      headerId = headerId || any.getAttribute('data-message-id');
+      messageId = messageId || any.getAttribute('data-legacy-message-id');
+    }
+  }
+  return { text, messageId, headerId };
 }
 
 chrome.runtime.onMessage.addListener((msg) => {
@@ -114,11 +144,11 @@ chrome.runtime.onMessage.addListener((msg) => {
         chrome.runtime.sendMessage({ type: 'mailmind_multi_summarize_request', items });
       }
     } else if (msg.action === 'single') {
-      const text = getOpenEmailText();
+      const { text, messageId, headerId } = getOpenEmailInfo();
       if (!text) addLine('Could not find opened email body.');
-      else chrome.runtime.sendMessage({ type: 'mailmind_single_summarize_request', body: text });
+      else chrome.runtime.sendMessage({ type: 'mailmind_single_summarize_request', body: text, messageId, headerId });
     } else if (msg.action === 'reply') {
-      const text = getOpenEmailText();
+      const { text } = getOpenEmailInfo();
       if (!text) addLine('Could not find opened email body.');
       else chrome.runtime.sendMessage({ type: 'mailmind_single_reply_request', body: text });
     }

@@ -2,8 +2,9 @@ const GMAIL_API_BASE = "https://www.googleapis.com/gmail/v1/users/me";
 const GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta";
 const GEMINI_MODEL = "gemini-2.5-flash";
 const GEMINI_KEY_STORAGE = "mailmind_gemini_api_key";
-const ID_CACHE_KEY = "mailmind_id_cache";
-const HASH_CACHE_KEY = "mailmind_hash_cache";
+const ID_CACHE_KEY = "mailmind_id_cache"; // legacy: messageId -> {summary, bodyHash}
+const HASH_CACHE_KEY = "mailmind_hash_cache"; // legacy: bodyHash -> {summary}
+const ID_HASH_CACHE_KEY = "mailmind_idhash_cache"; // NEW: sha256(messageId) -> {summary}
 const QUEUE_DELAY_MS = 1800;
 
 let processing = false;
@@ -12,6 +13,16 @@ let enqueued = new Set();
 
 function log(...args) {
   console.log("[MailMind]", ...args);
+}
+
+function getHeader(headers, name) {
+  if (!headers || !Array.isArray(headers)) return null;
+  const target = String(name).toLowerCase();
+  for (const h of headers) {
+    if (!h || !h.name) continue;
+    if (String(h.name).toLowerCase() === target) return h.value || null;
+  }
+  return null;
 }
 
 function getFromStorage(keys) {
@@ -207,31 +218,42 @@ async function callGeminiReply(emailText) {
 }
 
 async function getCaches() {
-  const items = await getFromStorage([ID_CACHE_KEY, HASH_CACHE_KEY]);
+  const items = await getFromStorage([ID_CACHE_KEY, HASH_CACHE_KEY, ID_HASH_CACHE_KEY]);
   return {
     idCache: items[ID_CACHE_KEY] || {},
     hashCache: items[HASH_CACHE_KEY] || {},
+    idHashCache: items[ID_HASH_CACHE_KEY] || {},
   };
 }
 
-async function setCaches(idCache, hashCache) {
-  await setInStorage({ [ID_CACHE_KEY]: idCache, [HASH_CACHE_KEY]: hashCache });
+async function setCaches(idCache, hashCache, idHashCache) {
+  await setInStorage({ [ID_CACHE_KEY]: idCache, [HASH_CACHE_KEY]: hashCache, [ID_HASH_CACHE_KEY]: idHashCache });
 }
 
 async function ensureSummaryCached(messageId, emailText) {
   const { idCache, hashCache } = await getCaches();
+  // Check Gmail messageId cache
   const existing = idCache[messageId];
   if (existing && existing.summary && existing.bodyHash) {
     return { cached: true, summary: existing.summary, bodyHash: existing.bodyHash };
   }
+  // Compute body hash and check cache
   const bodyHash = await sha256(emailText);
   if (hashCache[bodyHash] && hashCache[bodyHash].summary) {
     const summary = hashCache[bodyHash].summary;
     idCache[messageId] = { summary, bodyHash, ts: Date.now() };
-    await setCaches(idCache, hashCache);
+    await setCaches(idCache, hashCache, (await getCaches()).idHashCache);
     return { cached: true, summary, bodyHash };
   }
   return { cached: false, bodyHash };
+}
+
+async function checkCachedByIdHash(messageId) {
+  const idHash = await sha256(String(messageId || ""));
+  const { idHashCache } = await getCaches();
+  const entry = idHashCache[idHash];
+  if (entry && entry.summary) return { cached: true, summary: entry.summary, idHash };
+  return { cached: false, idHash };
 }
 
 function sendToTab(tabId, payload) {
@@ -249,7 +271,20 @@ async function processQueue() {
     enqueued.delete(item.key);
     log("Processing queue item", { key: item.key, remaining: queue.length });
     try {
-      const { idCache, hashCache } = await getCaches();
+      const { idCache, hashCache, idHashCache } = await getCaches();
+      // Check id-hash cache again before calling Gemini (defensive).
+      const idHashEntry = item.idHash ? idHashCache[item.idHash] : undefined;
+      if (idHashEntry && idHashEntry.summary) {
+        log("Cache hit by idHash during processing", { messageId: item.messageId });
+        sendToTab(item.tabId, {
+          type: "mailmind_summary_result",
+          messageId: item.messageId,
+          summary: idHashEntry.summary,
+          source: "cache-id",
+        });
+        await sleep(QUEUE_DELAY_MS);
+        continue;
+      }
       const idEntry = idCache[item.messageId];
       if (idEntry && idEntry.summary && idEntry.bodyHash === item.bodyHash) {
         log("Cache hit by messageId during processing", item.messageId);
@@ -268,7 +303,10 @@ async function processQueue() {
 
       idCache[item.messageId] = { summary, bodyHash: item.bodyHash, ts: Date.now() };
       hashCache[item.bodyHash] = { summary, ts: Date.now(), messageId: item.messageId };
-      await setCaches(idCache, hashCache);
+      if (item.idHash) {
+        idHashCache[item.idHash] = { summary, ts: Date.now(), messageId: item.messageId };
+      }
+      await setCaches(idCache, hashCache, idHashCache);
 
       sendToTab(item.tabId, {
         type: "mailmind_summary_result",
@@ -302,9 +340,33 @@ async function handleMultiSummarizeRequest(items, tabId) {
           continue;
         }
         const msg = await fetchMessageById(it.id);
+        // Prefer header Message-Id for id-hash caching
+        const headerMessageId =
+          getHeader(msg && msg.payload && msg.payload.headers, 'Message-Id') ||
+          getHeader(msg && msg.payload && msg.payload.headers, 'Message-ID');
+        let idHashCheck = { cached: false, idHash: undefined };
+        if (headerMessageId) {
+          idHashCheck = await checkCachedByIdHash(headerMessageId);
+          if (idHashCheck.cached) {
+            log("Cache-id hit (multi:message)", { messageId: it.id });
+            sendToTab(tabId, {
+              type: "mailmind_summary_result",
+              messageId: it.id,
+              summary: idHashCheck.summary,
+              source: "cache-id",
+            });
+            continue;
+          }
+        }
         const text = extractPlainTextFromMessage(msg);
         const cacheCheck = await ensureSummaryCached(it.id, text);
         if (cacheCheck.cached) {
+          // If we have a header id but id-hash wasn't cached, persist it now
+          if (headerMessageId && idHashCheck && idHashCheck.idHash && !idHashCheck.cached) {
+            const { idCache, hashCache, idHashCache } = await getCaches();
+            idHashCache[idHashCheck.idHash] = { summary: cacheCheck.summary, ts: Date.now(), messageId: it.id };
+            await setCaches(idCache, hashCache, idHashCache);
+          }
           sendToTab(tabId, {
             type: "mailmind_summary_result",
             messageId: it.id,
@@ -318,6 +380,7 @@ async function handleMultiSummarizeRequest(items, tabId) {
           messageId: it.id,
           bodyHash: cacheCheck.bodyHash,
           emailText: text,
+          idHash: idHashCheck.idHash, // may be undefined if header id not found
           tabId,
         };
         queue.push(qItem);
@@ -334,9 +397,31 @@ async function handleMultiSummarizeRequest(items, tabId) {
           log("Duplicate prevented (thread->message)", msgId);
           continue;
         }
+        const headerMessageId =
+          getHeader(last && last.payload && last.payload.headers, 'Message-Id') ||
+          getHeader(last && last.payload && last.payload.headers, 'Message-ID');
+        let idHashCheck = { cached: false, idHash: undefined };
+        if (headerMessageId) {
+          idHashCheck = await checkCachedByIdHash(headerMessageId);
+          if (idHashCheck.cached) {
+            log("Cache-id hit (multi:thread)", { messageId: msgId });
+            sendToTab(tabId, {
+              type: "mailmind_summary_result",
+              messageId: msgId,
+              summary: idHashCheck.summary,
+              source: "cache-id",
+            });
+            continue;
+          }
+        }
         const text = extractPlainTextFromMessage(last);
         const cacheCheck = await ensureSummaryCached(msgId, text);
         if (cacheCheck.cached) {
+          if (headerMessageId && idHashCheck && idHashCheck.idHash && !idHashCheck.cached) {
+            const { idCache, hashCache, idHashCache } = await getCaches();
+            idHashCache[idHashCheck.idHash] = { summary: cacheCheck.summary, ts: Date.now(), messageId: msgId };
+            await setCaches(idCache, hashCache, idHashCache);
+          }
           sendToTab(tabId, {
             type: "mailmind_summary_result",
             messageId: msgId,
@@ -350,6 +435,7 @@ async function handleMultiSummarizeRequest(items, tabId) {
           messageId: msgId,
           bodyHash: cacheCheck.bodyHash,
           emailText: text,
+          idHash: idHashCheck.idHash,
           tabId,
         };
         queue.push(qItem);
@@ -380,9 +466,52 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       const tabId = msg.tabId || (sender && sender.tab && sender.tab.id);
       (async () => {
         try {
-          const summary = await callGemini(msg.body || "");
+          const messageId = msg.messageId;
+          const headerId = msg.headerId;
+          // 1) Try ID-hash cache (prefer header Message-Id if available)
+          if (headerId) {
+            const idHashCheck = await checkCachedByIdHash(headerId);
+            if (idHashCheck.cached) {
+              log("Single summary: cache-id hit (header)", { headerId });
+              sendToTab(tabId, { type: "mailmind_single_result", mode: "summary", summary: idHashCheck.summary, source: "cache-id" });
+              sendResponse({ ok: true, cached: true });
+              return;
+            }
+          } else if (messageId) {
+            const idHashCheck = await checkCachedByIdHash(messageId);
+            if (idHashCheck.cached) {
+              log("Single summary: cache-id hit (gmailId)", { messageId });
+              sendToTab(tabId, { type: "mailmind_single_result", mode: "summary", summary: idHashCheck.summary, source: "cache-id" });
+              sendResponse({ ok: true, cached: true });
+              return;
+            }
+          }
+          // 2) Try body-hash cache
+          const bodyText = msg.body || "";
+          const bodyHash = await sha256(bodyText);
+          {
+            const { hashCache } = await getCaches();
+            if (hashCache[bodyHash] && hashCache[bodyHash].summary) {
+              log("Single summary: cache-body hit", { bodyHash });
+              sendToTab(tabId, { type: "mailmind_single_result", mode: "summary", summary: hashCache[bodyHash].summary, source: "cache-body" });
+              sendResponse({ ok: true, cached: true });
+              return;
+            }
+          }
+          // 3) Call Gemini
+          const summary = await callGemini(bodyText);
           log("Final parsed summary (single)", { length: summary.length });
-          sendToTab(tabId, { type: "mailmind_single_result", mode: "summary", summary });
+          // Store in caches: body-hash always; id-hash if we have id
+          const { idCache, hashCache, idHashCache } = await getCaches();
+          hashCache[bodyHash] = { summary, ts: Date.now(), messageId: messageId || null };
+          const idBasis = headerId || messageId;
+          if (idBasis) {
+            const idHash = (await checkCachedByIdHash(idBasis)).idHash;
+            idHashCache[idHash] = { summary, ts: Date.now(), messageId: messageId || null };
+            log("Single summary: stored id-hash mapping", { idBasis });
+          }
+          await setCaches(idCache, hashCache, idHashCache);
+          sendToTab(tabId, { type: "mailmind_single_result", mode: "summary", summary, source: "gemini" });
           sendResponse({ ok: true });
         } catch (e) {
           sendToTab(tabId, { type: "mailmind_single_error", mode: "summary", error: (e && e.message) || String(e) });
